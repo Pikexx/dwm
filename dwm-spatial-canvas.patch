@@ -1,0 +1,260 @@
+--- a/dwm.c
++++ b/dwm.c
+@@ -117,6 +117,7 @@
+ 	int oldx, oldy, oldw, oldh;
+ 	int basew, baseh, incw, inch, maxw, maxh, minw, minh;
+ 	int bw, oldbw;
++	int gx, gy;              /* spatial canvas: absolute position on the infinite canvas */
+ 	unsigned int tags;
+ 	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen, isterminal, noswallow;
+ 	pid_t pid;
+@@ -148,6 +149,7 @@
+ 	int mx, my, mw, mh;   /* screen size */
+ 	int wx, wy, ww, wh;   /* window area  */
+ 	int gappx;            /* gaps between windows */
++	int vx, vy;           /* spatial canvas: viewport offset (camera position on canvas) */
+ 	unsigned int seltags;
+ 	unsigned int sellt;
+ 	unsigned int tagset[2];
+@@ -265,10 +267,10 @@
+ static void updatetitle(Client *c);
+ static void updatewindowtype(Client *c);
+ static void updatewmhints(Client *c);
++static void tagtocanvas(unsigned int tagmask, Monitor *m, int *nvx, int *nvy);
+ static void view(const Arg *arg);
+ static void window_set_state(Display *dpy, Window win, long state);
+ static void window_map(Display *dpy, Client *c, int deiconify);
+-static void window_unmap(Display *dpy, Window win, Window root, int iconify);
+ static Client *wintoclient(Window w);
+ static Monitor *wintomon(Window w);
+ static int xerror(Display *dpy, XErrorEvent *ee);
+@@ -515,7 +517,11 @@
+ 	updatetitle(c);
+ 	arrange(c->mon);
+ 	XMapWindow(dpy, c->win);
+-	XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++	/* Spatial canvas: restore screen position from canvas coords */
++	XMoveResizeWindow(dpy, c->win,
++	                  c->gx - c->mon->vx,
++	                  c->gy - c->mon->vy,
++	                  c->w, c->h);
+ 	setclientstate(c, NormalState);
+ 	focus(NULL);
+ 	arrange(c->mon);
+@@ -649,8 +655,9 @@
+ 	ce.display = dpy;
+ 	ce.event = c->win;
+ 	ce.window = c->win;
+-	ce.x = c->x;
+-	ce.y = c->y;
++	/* Spatial canvas: report the actual screen position to the client */
++	ce.x = c->gx - c->mon->vx;
++	ce.y = c->gy - c->mon->vy;
+ 	ce.width = c->w;
+ 	ce.height = c->h;
+ 	ce.border_width = c->bw;
+@@ -722,8 +729,11 @@
+ 				c->y = m->my + (m->mh / 2 - HEIGHT(c) / 2); /* center in y direction */
+ 			if ((ev->value_mask & (CWX|CWY)) && !(ev->value_mask & (CWWidth|CWHeight)))
+ 				configure(c);
++			/* Spatial canvas: keep gx/gy in sync with any manual position changes */
++			c->gx = c->x + m->vx;
++			c->gy = c->y + m->vy;
+ 			if (ISVISIBLE(c))
+-				XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++				XMoveResizeWindow(dpy, c->win, c->gx - m->vx, c->gy - m->vy, c->w, c->h);
+ 		} else
+ 			configure(c);
+ 	} else {
+@@ -911,6 +921,20 @@
+ 		grabbuttons(c, 1);
+ 		XSetWindowBorder(dpy, c->win, scheme[SchemeSel][ColBorder].pixel);
+ 		setfocus(c);
++
++		/* Spatial canvas: auto-pan viewport if focused window is outside current view */
++		{
++			Monitor *m = c->mon;
++			int sx = c->gx - m->vx;
++			int sy = c->gy - m->vy;
++			if (sx < m->wx || sx + WIDTH(c) > m->wx + m->ww ||
++			    sy < m->wy || sy + HEIGHT(c) > m->wy + m->wh) {
++				/* Slide camera to center on the window's canvas position */
++				m->vx = c->gx - m->wx - (m->ww - WIDTH(c)) / 2;
++				m->vy = c->gy - m->wy - (m->wh - HEIGHT(c)) / 2;
++				arrange(m);
++			}
++		}
+ 	} else {
+ 		XSetInputFocus(dpy, root, RevertToPointerRoot, CurrentTime);
+ 		XDeleteProperty(dpy, root, netatom[NetActiveWindow]);
+@@ -1205,6 +1229,9 @@
+ 	updatewmhints(c);
+ 	c->x = c->mon->mx + (c->mon->mw - WIDTH(c)) / 2;
+ 	c->y = c->mon->my + (c->mon->mh - HEIGHT(c)) / 2;
++	/* Spatial canvas: place new window on the canvas at the current viewport zone */
++	c->gx = c->x + c->mon->vx;
++	c->gy = c->y + c->mon->vy;
+ 	XSelectInput(dpy, w, EnterWindowMask|FocusChangeMask|PropertyChangeMask|StructureNotifyMask);
+ 	grabbuttons(c, 0);
+ 	if (!c->isfloating)
+@@ -1215,7 +1242,7 @@
+ 	attachstack(c);
+ 	XChangeProperty(dpy, root, netatom[NetClientList], XA_WINDOW, 32, PropModeAppend,
+ 		(unsigned char *) &(c->win), 1);
+-	XMoveResizeWindow(dpy, c->win, c->x + 2 * sw, c->y, c->w, c->h); /* some windows require this */
++	XMoveResizeWindow(dpy, c->win, c->gx - c->mon->vx + 2 * sw, c->gy - c->mon->vy, c->w, c->h); /* some windows require this */
+ 	setclientstate(c, NormalState);
+ 	if (c->mon == selmon)
+ 		unfocus(selmon->sel, 0);
+@@ -1327,8 +1354,12 @@
+ 				ny = selmon->wy;
+ 			else if (abs((selmon->wy + selmon->wh) - (ny + HEIGHT(c))) < snap)
+ 				ny = selmon->wy + selmon->wh - HEIGHT(c);
+-			if (!selmon->lt[selmon->sellt]->arrange || c->isfloating)
++			if (!selmon->lt[selmon->sellt]->arrange || c->isfloating) {
+ 				resize(c, nx, ny, c->w, c->h, 1);
++				/* Spatial canvas: sync canvas position after drag */
++				c->gx = c->x + selmon->vx;
++				c->gy = c->y + selmon->vy;
++			}
+ 			else if (selmon->lt[selmon->sellt]->arrange || !c->isfloating) {
+ 				if ((m = recttomon(ev.xmotion.x_root, ev.xmotion.y_root, 1, 1)) != selmon) {
+ 					sendmon(c, m);
+@@ -1476,11 +1507,23 @@
+ resizeclient(Client *c, int x, int y, int w, int h)
+ {
+ 	XWindowChanges wc;
++	Monitor *m = c->mon;
+ 
+-	c->oldx = c->x; c->x = wc.x = x;
+-	c->oldy = c->y; c->y = wc.y = y;
++	c->oldx = c->x; c->x = x;
++	c->oldy = c->y; c->y = y;
+ 	c->oldw = c->w; c->w = wc.width = w;
+ 	c->oldh = c->h; c->h = wc.height = h;
++
++	/*
++	 * Spatial canvas: store absolute canvas coordinates.
++	 * layout functions pass screen-relative positions (m->wx + offset).
++	 * Canvas position = screen_pos + viewport_offset.
++	 * Actual X11 position = gx - vx  (= x, unchanged while viewport is the same).
++	 */
++	c->gx = x + m->vx;
++	c->gy = y + m->vy;
++	wc.x = c->gx - m->vx;   /* = x */
++	wc.y = c->gy - m->vy;   /* = y */
+ 	wc.border_width = c->bw;
+ 	XConfigureWindow(dpy, c->win, CWX|CWY|CWWidth|CWHeight|CWBorderWidth, &wc);
+ 	configure(c);
+@@ -1710,8 +1753,9 @@
+ 		c->isfullscreen = 0;
+ 		c->isfloating = c->oldstate;
+ 		c->bw = c->oldbw;
+-		c->x = c->oldx;
+-		c->y = c->oldy;
++		/* Restore from stored canvas position */
++		c->x = c->gx - c->mon->vx;
++		c->y = c->gy - c->mon->vy;
+ 		c->w = c->oldw;
+ 		c->h = c->oldh;
+ 		resizeclient(c, c->x, c->y, c->w, c->h);
+@@ -1865,13 +1909,20 @@
+ 	if (!c)
+ 		return;
+ 	if (ISVISIBLE(c)) {
+-		/* show clients top down */
++		/* Visible windows: map and position (arrangemon handles their canvas coords) */
+ 		window_map(dpy, c, 1);
+ 		showhide(c->snext);
+ 	} else {
+-		/* hide clients bottom up */
++		/*
++		 * Spatial canvas: do NOT unmap off-viewport windows.
++		 * Keep them mapped but slide their physical position to gx-vx, gy-vy,
++		 * which places them off the visible screen area.
++		 */
+ 		showhide(c->snext);
+-		window_unmap(dpy, c->win, root, 1);
++		XMapWindow(dpy, c->win);
++		XMoveWindow(dpy, c->win,
++		            c->gx - c->mon->vx,
++		            c->gy - c->mon->vy);
+ 	}
+ }
+ 
+@@ -2327,47 +2378,52 @@
+ 	if (deiconify)
+ 		window_set_state(dpy, win, NormalState);
+ 
+-	XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++	/* Spatial canvas: actual screen position = canvas_pos - viewport_offset */
++	XMoveResizeWindow(dpy, c->win,
++	                  c->gx - c->mon->vx,
++	                  c->gy - c->mon->vy,
++	                  c->w, c->h);
+ 	XSetInputFocus(dpy, win, RevertToPointerRoot, CurrentTime);
+ 	XMapWindow(dpy, win);
+ }
+ 
+-void
+-window_unmap(Display *dpy, Window win, Window root, int iconify)
+-{
+-	static XWindowAttributes ca, ra;
+-
+-	XGrabServer(dpy);
+-	XGetWindowAttributes(dpy, root, &ra);
+-	XGetWindowAttributes(dpy, win, &ca);
+-
+-	/* Prevent UnmapNotify events */
+-	XSelectInput(dpy, root, ra.your_event_mask & ~SubstructureNotifyMask);
+-	XSelectInput(dpy, win, ca.your_event_mask & ~StructureNotifyMask);
+-
+-	XUnmapWindow(dpy, win);
+-
+-	if (iconify)
+-		window_set_state(dpy, win, IconicState);
+-
+-	XSelectInput(dpy, root, ra.your_event_mask);
+-	XSelectInput(dpy, win, ca.your_event_mask);
+-	XUngrabServer(dpy);
+-}
+ 
+ void
+ view(const Arg *arg)
+ {
++	int nvx, nvy;
+ 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
+ 		return;
+ 	selmon->seltags ^= 1; /* toggle sel tagset */
+ 	if (arg->ui & TAGMASK)
+ 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
++	/* Spatial canvas: move viewport to the selected tag's zone on the 3x3 grid */
++	tagtocanvas(selmon->tagset[selmon->seltags], selmon, &nvx, &nvy);
++	selmon->vx = nvx;
++	selmon->vy = nvy;
+ 	focus(NULL);
+ 	arrange(selmon);
+ 	updatecurrentdesktop();
+ }
+ 
++/*
++ * Spatial canvas helper: maps a tag bitmask to a viewport (vx, vy) offset.
++ * The 9 standard dwm tags are laid out as a 3x3 grid:
++ *   Tag1(0,0)   Tag2(mw,0)   Tag3(2mw,0)
++ *   Tag4(0,mh)  Tag5(mw,mh)  Tag6(2mw,mh)
++ *   Tag7(0,2mh) Tag8(mw,2mh) Tag9(2mw,2mh)
++ */
++static void
++tagtocanvas(unsigned int tagmask, Monitor *m, int *nvx, int *nvy)
++{
++	int i = 0;
++	unsigned int t = tagmask & TAGMASK;
++	/* find the index of the lowest set bit */
++	while (t > 1) { t >>= 1; i++; }
++	*nvx = (i % 3) * m->mw;
++	*nvy = (i / 3) * m->mh;
++}
++
+ pid_t
+ winpid(Window w)
+ {

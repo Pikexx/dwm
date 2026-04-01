@@ -1,0 +1,242 @@
+--- dwm.c
++++ dwm.c
+@@ -117,6 +117,7 @@
+ 	int oldx, oldy, oldw, oldh;
+ 	int basew, baseh, incw, inch, maxw, maxh, minw, minh;
+ 	int bw, oldbw;
++	int gx, gy;              /* canvas: absolute position on infinite canvas */
+ 	unsigned int tags;
+ 	int isfixed, isfloating, isurgent, neverfocus, oldstate, isfullscreen, isterminal, noswallow;
+ 	pid_t pid;
+@@ -148,6 +149,7 @@
+ 	int mx, my, mw, mh;   /* screen size */
+ 	int wx, wy, ww, wh;   /* window area  */
+ 	int gappx;            /* gaps between windows */
++	int vx, vy;           /* canvas: viewport/camera offset */
+ 	unsigned int seltags;
+ 	unsigned int sellt;
+ 	unsigned int tagset[2];
+@@ -269,7 +272,6 @@
+ static void view(const Arg *arg);
+ static void window_set_state(Display *dpy, Window win, long state);
+ static void window_map(Display *dpy, Client *c, int deiconify);
+-static void window_unmap(Display *dpy, Window win, Window root, int iconify);
+ static Client *wintoclient(Window w);
+ static Monitor *wintomon(Window w);
+ static int xerror(Display *dpy, XErrorEvent *ee);
+@@ -516,7 +518,10 @@
+ 	updatetitle(c);
+ 	arrange(c->mon);
+ 	XMapWindow(dpy, c->win);
+-	XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++	XMoveResizeWindow(dpy, c->win,
++	                  c->gx - c->mon->vx,
++	                  c->gy - c->mon->vy,
++	                  c->w, c->h);
+ 	setclientstate(c, NormalState);
+ 	focus(NULL);
+ 	arrange(c->mon);
+@@ -650,8 +655,8 @@
+ 	ce.display = dpy;
+ 	ce.event = c->win;
+ 	ce.window = c->win;
+-	ce.x = c->x;
+-	ce.y = c->y;
++	ce.x = c->gx - c->mon->vx;
++	ce.y = c->gy - c->mon->vy;
+ 	ce.width = c->w;
+ 	ce.height = c->h;
+ 	ce.border_width = c->bw;
+@@ -718,13 +723,16 @@
+ 				c->h = ev->height;
+ 			}
+ 			if ((c->x + c->w) > m->mx + m->mw && c->isfloating)
+-				c->x = m->mx + (m->mw / 2 - WIDTH(c) / 2); /* center in x direction */
++				c->x = m->mx + (m->mw / 2 - WIDTH(c) / 2);
+ 			if ((c->y + c->h) > m->my + m->mh && c->isfloating)
+-				c->y = m->my + (m->mh / 2 - HEIGHT(c) / 2); /* center in y direction */
++				c->y = m->my + (m->mh / 2 - HEIGHT(c) / 2);
+ 			if ((ev->value_mask & (CWX|CWY)) && !(ev->value_mask & (CWWidth|CWHeight)))
+ 				configure(c);
++			/* canvas: keep gx/gy in sync */
++			c->gx = c->x + m->vx;
++			c->gy = c->y + m->vy;
+ 			if (ISVISIBLE(c))
+-				XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++				XMoveResizeWindow(dpy, c->win, c->gx - m->vx, c->gy - m->vy, c->w, c->h);
+ 		} else
+ 			configure(c);
+ 	} else {
+@@ -1204,8 +1212,11 @@
+ 	updatewindowtype(c);
+ 	updatesizehints(c);
+ 	updatewmhints(c);
+-	c->x = c->mon->mx + (c->mon->mw - WIDTH(c)) / 2;
+-	c->y = c->mon->my + (c->mon->mh - HEIGHT(c)) / 2;
++	c->x = c->mon->wx + (c->mon->ww - WIDTH(c)) / 2;
++	c->y = c->mon->wy + (c->mon->wh - HEIGHT(c)) / 2;
++	/* canvas: place new window at current viewport position */
++	c->gx = c->x + c->mon->vx;
++	c->gy = c->y + c->mon->vy;
+ 	XSelectInput(dpy, w, EnterWindowMask|FocusChangeMask|PropertyChangeMask|StructureNotifyMask);
+ 	grabbuttons(c, 0);
+ 	if (!c->isfloating)
+@@ -1216,7 +1227,7 @@
+ 	attachstack(c);
+ 	XChangeProperty(dpy, root, netatom[NetClientList], XA_WINDOW, 32, PropModeAppend,
+ 		(unsigned char *) &(c->win), 1);
+-	XMoveResizeWindow(dpy, c->win, c->x + 2 * sw, c->y, c->w, c->h); /* some windows require this */
++	XMoveResizeWindow(dpy, c->win, c->gx - c->mon->vx + 2 * sw, c->gy - c->mon->vy, c->w, c->h); /* some windows require this */
+ 	setclientstate(c, NormalState);
+ 	if (c->mon == selmon)
+ 		unfocus(selmon->sel, 0);
+@@ -1328,8 +1339,12 @@
+ 				ny = selmon->wy;
+ 			else if (abs((selmon->wy + selmon->wh) - (ny + HEIGHT(c))) < snap)
+ 				ny = selmon->wy + selmon->wh - HEIGHT(c);
+-			if (!selmon->lt[selmon->sellt]->arrange || c->isfloating)
++			if (!selmon->lt[selmon->sellt]->arrange || c->isfloating) {
+ 				resize(c, nx, ny, c->w, c->h, 1);
++				/* canvas: sync absolute position after drag */
++				c->gx = c->x + selmon->vx;
++				c->gy = c->y + selmon->vy;
++			}
+ 			else if (selmon->lt[selmon->sellt]->arrange || !c->isfloating) {
+ 				if ((m = recttomon(ev.xmotion.x_root, ev.xmotion.y_root, 1, 1)) != selmon) {
+ 					sendmon(c, m);
+@@ -1477,11 +1492,17 @@
+ resizeclient(Client *c, int x, int y, int w, int h)
+ {
+ 	XWindowChanges wc;
++	Monitor *m = c->mon;
+ 
+-	c->oldx = c->x; c->x = wc.x = x;
+-	c->oldy = c->y; c->y = wc.y = y;
++	c->oldx = c->x; c->x = x;
++	c->oldy = c->y; c->y = y;
+ 	c->oldw = c->w; c->w = wc.width = w;
+ 	c->oldh = c->h; c->h = wc.height = h;
++	/* canvas: absolute position = screen_pos + viewport_offset */
++	c->gx = x + m->vx;
++	c->gy = y + m->vy;
++	wc.x = c->gx - m->vx;
++	wc.y = c->gy - m->vy;
+ 	wc.border_width = c->bw;
+ 	XConfigureWindow(dpy, c->win, CWX|CWY|CWWidth|CWHeight|CWBorderWidth, &wc);
+ 	configure(c);
+@@ -1711,8 +1732,8 @@
+ 		c->isfullscreen = 0;
+ 		c->isfloating = c->oldstate;
+ 		c->bw = c->oldbw;
+-		c->x = c->oldx;
+-		c->y = c->oldy;
++		c->x = c->gx - c->mon->vx;
++		c->y = c->gy - c->mon->vy;
+ 		c->w = c->oldw;
+ 		c->h = c->oldh;
+ 		resizeclient(c, c->x, c->y, c->w, c->h);
+@@ -1867,12 +1888,23 @@
+ 		return;
+ 	if (ISVISIBLE(c)) {
+ 		/* show clients top down */
+-		window_map(dpy, c, 1);
++		XMapWindow(dpy, c->win);
++		XMoveResizeWindow(dpy, c->win,
++		                  c->gx - c->mon->vx,
++		                  c->gy - c->mon->vy,
++		                  c->w, c->h);
+ 		showhide(c->snext);
+ 	} else {
+-		/* hide clients bottom up */
++		/*
++		 * Canvas: do NOT unmap — keep window alive in X.
++		 * Move it to its canvas-relative screen position; if it is
++		 * outside the current viewport it will be off-screen naturally.
++		 */
+ 		showhide(c->snext);
+-		window_unmap(dpy, c->win, root, 1);
++		XMapWindow(dpy, c->win);
++		XMoveWindow(dpy, c->win,
++		            c->gx - c->mon->vx,
++		            c->gy - c->mon->vy);
+ 	}
+ }
+ 
+@@ -2328,32 +2360,60 @@
+ 	if (deiconify)
+ 		window_set_state(dpy, win, NormalState);
+ 
+-	XMoveResizeWindow(dpy, c->win, c->x, c->y, c->w, c->h);
++	/* canvas: actual screen position = canvas_pos - viewport_offset */
++	XMoveResizeWindow(dpy, c->win,
++	                  c->gx - c->mon->vx,
++	                  c->gy - c->mon->vy,
++	                  c->w, c->h);
+ 	XSetInputFocus(dpy, win, RevertToPointerRoot, CurrentTime);
+ 	XMapWindow(dpy, win);
+ }
+ 
++/*
++ * Canvas pan: hold Mod4 + left-click on the root window and drag to move
++ * the camera freely across the infinite canvas.  All windows reposition
++ * instantly (arrange) on every motion tick, capped at 60 fps.
++ */
+ void
+-window_unmap(Display *dpy, Window win, Window root, int iconify)
++panmouse(const Arg *arg)
+ {
+-	static XWindowAttributes ca, ra;
+-
+-	XGrabServer(dpy);
+-	XGetWindowAttributes(dpy, root, &ra);
+-	XGetWindowAttributes(dpy, win, &ca);
+-
+-	/* Prevent UnmapNotify events */
+-	XSelectInput(dpy, root, ra.your_event_mask & ~SubstructureNotifyMask);
+-	XSelectInput(dpy, win, ca.your_event_mask & ~StructureNotifyMask);
++	int x, y, ox, oy;
++	XEvent ev;
++	Time lasttime = 0;
+ 
+-	XUnmapWindow(dpy, win);
++	if (!getrootptr(&x, &y))
++		return;
++	if (XGrabPointer(dpy, root, False, MOUSEMASK, GrabModeAsync, GrabModeAsync,
++	    None, cursor[CurMove]->cursor, CurrentTime) != GrabSuccess)
++		return;
+ 
+-	if (iconify)
+-		window_set_state(dpy, win, IconicState);
++	ox = x; oy = y;
++	do {
++		XMaskEvent(dpy, MOUSEMASK|ExposureMask|SubstructureRedirectMask, &ev);
++		switch (ev.type) {
++		case ConfigureRequest:
++		case Expose:
++		case MapRequest:
++			handler[ev.type](&ev);
++			break;
++		case MotionNotify:
++			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
++				continue;
++			lasttime = ev.xmotion.time;
++			/* pan: drag right moves camera right (vx increases) */
++			selmon->vx -= ev.xmotion.x - ox;
++			selmon->vy -= ev.xmotion.y - oy;
++			ox = ev.xmotion.x;
++			oy = ev.xmotion.y;
++			/* reposition all windows without a full re-layout */
++			arrange(selmon);
++			break;
++		}
++	} while (ev.type != ButtonRelease);
+ 
+-	XSelectInput(dpy, root, ra.your_event_mask);
+-	XSelectInput(dpy, win, ca.your_event_mask);
+-	XUngrabServer(dpy);
++	XUngrabPointer(dpy, CurrentTime);
++	/* flush any stale EnterNotify events from the pan */
++	while (XCheckMaskEvent(dpy, EnterWindowMask, &ev));
+ }
+ 
+ void

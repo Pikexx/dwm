@@ -1,0 +1,29 @@
+--- a/dwm.c
++++ b/dwm.c
+@@ -2457,7 +2457,7 @@
+ {
+ 	Client *c;
+ 	int oldtag;
+-	const unsigned long OPAQUE = 0xFFFFFFFFUL;
++	const unsigned long OPACITY_FULL = 0xFFFFFFFFUL;
+ 
+ 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
+ 		return;
+@@ -2510,7 +2510,7 @@
+ 		struct timespec ts = { 0, 12000000L };
+ 		int step;
+ 		for (step = 0; step <= STEPS; step++) {
+-			unsigned long op = (unsigned long)(OPAQUE * step / STEPS);
++			unsigned long op = (unsigned long)(OPACITY_FULL * step / STEPS);
+ 			for (c = selmon->clients; c; c = c->next)
+ 				if (ISVISIBLE(c))
+ 					setopacity(c, op);
+@@ -2521,7 +2521,7 @@
+ 
+ 	/* Guarantee full opacity at rest */
+ 	for (c = selmon->clients; c; c = c->next)
+-		setopacity(c, OPAQUE);
++		setopacity(c, OPACITY_FULL);
+ 	XFlush(dpy);
+ 
+ 	/* Warp cursor after windows are fully placed and visible */

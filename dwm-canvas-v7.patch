@@ -1,0 +1,271 @@
+--- a/dwm.c
++++ b/dwm.c
+@@ -27,6 +27,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <sys/wait.h>
+@@ -149,7 +150,9 @@
+ 	int mx, my, mw, mh;   /* screen size */
+ 	int wx, wy, ww, wh;   /* window area  */
+ 	int gappx;            /* gaps between windows */
+-	int vx, vy;           /* canvas: viewport/camera offset */
++	int vx, vy;           /* canvas: active viewport offset (cache of tagvx/tagvy) */
++	int tagvx[32];        /* canvas: per-tag saved viewport X — each tag independent */
++	int tagvy[32];        /* canvas: per-tag saved viewport Y */
+ 	unsigned int seltags;
+ 	unsigned int sellt;
+ 	unsigned int tagset[2];
+@@ -220,6 +223,8 @@
+ static void movemouse(const Arg *arg);
+ static void panmouse(const Arg *arg);
+ static Client *nexttiled(Client *c);
++static int seltagidx(Monitor *m);
++static void animatepan(Monitor *m, int fromvx, int fromvy, int tovx, int tovy);
+ static void pop(Client *);
+ static void propertynotify(XEvent *e);
+ static void quit(const Arg *arg);
+@@ -332,6 +337,10 @@
+ static int depth;
+ static Colormap cmap;
+ 
++/* canvas pan animation: number of frames and frame time in ms */
++#define CANVAS_ANIM_FRAMES 14
++#define CANVAS_ANIM_MS     12
++
+ /* configuration, allows nested code to access above variables */
+ #include "config.h"
+ 
+@@ -1317,8 +1326,16 @@
+ 
+ 	if (!(c = selmon->sel))
+ 		return;
+-	if (c->isfullscreen) /* no support moving fullscreen windows by mouse */
++	if (c->isfullscreen)
+ 		return;
++	/*
++	 * Canvas: auto-float tiled windows before dragging so they move freely
++	 * instead of triggering the tile-swap branch.
++	 */
++	if (!c->isfloating && selmon->lt[selmon->sellt]->arrange) {
++		c->isfloating = 1;
++		XRaiseWindow(dpy, c->win);
++	}
+ 	restack(selmon);
+ 	ocx = c->x;
+ 	ocy = c->y;
+@@ -1340,82 +1357,19 @@
+ 			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
+ 				continue;
+ 			lasttime = ev.xmotion.time;
+-
+ 			nx = ocx + (ev.xmotion.x - x);
+ 			ny = ocy + (ev.xmotion.y - y);
+-			/* Clamp strictly to viewport — prevents window drifting into
+-			 * another workspace's canvas zone and appearing there. */
+-			if (nx < selmon->wx)
+-				nx = selmon->wx;
+-			else if (nx + WIDTH(c) > selmon->wx + selmon->ww)
+-				nx = selmon->wx + selmon->ww - WIDTH(c);
+-			if (ny < selmon->wy)
+-				ny = selmon->wy;
+-			else if (ny + HEIGHT(c) > selmon->wy + selmon->wh)
+-				ny = selmon->wy + selmon->wh - HEIGHT(c);
+-			if (!selmon->lt[selmon->sellt]->arrange || c->isfloating) {
+-				resize(c, nx, ny, c->w, c->h, 1);
+-				/* canvas: sync absolute position after drag */
+-				c->gx = c->x + selmon->vx;
+-				c->gy = c->y + selmon->vy;
+-			}
+-			else if (selmon->lt[selmon->sellt]->arrange || !c->isfloating) {
+-				if ((m = recttomon(ev.xmotion.x_root, ev.xmotion.y_root, 1, 1)) != selmon) {
+-					sendmon(c, m);
+-					selmon = m;
+-					focus(NULL);
+-				}
+-
+-				Client *cc = c->mon->clients;
+-				while (1) {
+-					if (cc == 0) break;
+-					if(
+-					 cc != c && !cc->isfloating && ISVISIBLE(cc) &&
+-					 ev.xmotion.x_root > cc->x &&
+-					 ev.xmotion.x_root < cc->x + cc->w &&
+-					 ev.xmotion.y_root > cc->y &&
+-					 ev.xmotion.y_root < cc->y + cc->h ) {
+-						break;
+-					}
+-
+-					cc = cc->next;
+-				}
+-
+-				if (cc) {
+-					Client *cl1, *cl2, ocl1;
+-
+-					if (!selmon->lt[selmon->sellt]->arrange) return;
+-
+-					cl1 = c;
+-					cl2 = cc;
+-					ocl1 = *cl1;
+-					strcpy(cl1->name, cl2->name);
+-					cl1->win = cl2->win;
+-					cl1->x = cl2->x;
+-					cl1->y = cl2->y;
+-					cl1->w = cl2->w;
+-					cl1->h = cl2->h;
+-
+-					cl2->win = ocl1.win;
+-					strcpy(cl2->name, ocl1.name);
+-					cl2->x = ocl1.x;
+-					cl2->y = ocl1.y;
+-					cl2->w = ocl1.w;
+-					cl2->h = ocl1.h;
+-
+-					selmon->sel = cl2;
+-
+-					c = cc;
+-					focus(c);
+-
+-					arrange(cl1->mon);
+-				}
+-			}
++			/* canvas: no viewport clamping — drag freely anywhere on canvas */
++			resize(c, nx, ny, c->w, c->h, 1);
++			/* keep canvas coords in sync with the new screen position */
++			c->gx = c->x + selmon->vx;
++			c->gy = c->y + selmon->vy;
+ 			break;
+ 		}
+ 	} while (ev.type != ButtonRelease);
+ 	wmisdragging = 0;
+ 	XUngrabPointer(dpy, CurrentTime);
++	while (XCheckMaskEvent(dpy, EnterWindowMask, &ev));
+ 	if ((m = recttomon(c->x, c->y, c->w, c->h)) != selmon) {
+ 		sendmon(c, m);
+ 		selmon = m;
+@@ -2372,9 +2326,53 @@
+ }
+ 
+ /*
++ * Returns the index (0-based) of the lowest set bit in the monitor's
++ * current tagset.  Used to index tagvx[]/tagvy[] for per-tag viewport.
++ * If multiple tags are visible, the lowest-numbered tag owns the viewport.
++ */
++int
++seltagidx(Monitor *m)
++{
++	unsigned int t = m->tagset[m->seltags] & TAGMASK;
++	int i = 0;
++	if (!t) return 0;
++	while (!(t & 1)) { t >>= 1; i++; }
++	return i;
++}
++
++/*
++ * Smooth ease-out animation: slides the viewport from (fromvx,fromvy) to
++ * (tovx,tovy) over CANVAS_ANIM_FRAMES frames at ~CANVAS_ANIM_MS each.
++ * Repositions all visible windows each frame without re-running the layout.
++ */
++static void
++animatepan(Monitor *m, int fromvx, int fromvy, int tovx, int tovy)
++{
++	Client *c;
++	int step;
++	struct timespec ts = { 0, CANVAS_ANIM_MS * 1000000L };
++
++	for (step = 1; step <= CANVAS_ANIM_FRAMES; step++) {
++		float t    = (float)step / CANVAS_ANIM_FRAMES;
++		float ease = 1.0f - (1.0f - t) * (1.0f - t); /* ease-out quadratic */
++		m->vx = fromvx + (int)((tovx - fromvx) * ease);
++		m->vy = fromvy + (int)((tovy - fromvy) * ease);
++		/* move all managed windows to their canvas-relative positions */
++		for (c = m->clients; c; c = c->next) {
++			if (ISVISIBLE(c))
++				XMoveWindow(dpy, c->win, c->gx - m->vx, c->gy - m->vy);
++		}
++		XFlush(dpy);
++		nanosleep(&ts, NULL);
++	}
++	m->vx = tovx;
++	m->vy = tovy;
++}
++
++/*
+  * Canvas pan: hold Mod4 + left-click on the root window and drag to move
+  * the camera freely across the infinite canvas.  All windows reposition
+- * instantly (arrange) on every motion tick, capped at 60 fps.
++ * instantly on every motion tick, capped at 60 fps.
+  */
+ void
+ panmouse(const Arg *arg)
+@@ -2402,37 +2400,60 @@
+ 			if ((ev.xmotion.time - lasttime) <= (1000 / 60))
+ 				continue;
+ 			lasttime = ev.xmotion.time;
+-			/* pan: drag right moves camera right (vx increases) */
+ 			selmon->vx -= ev.xmotion.x - ox;
+ 			selmon->vy -= ev.xmotion.y - oy;
++			/* persist to per-tag store so switching away and back preserves position */
++			selmon->tagvx[seltagidx(selmon)] = selmon->vx;
++			selmon->tagvy[seltagidx(selmon)] = selmon->vy;
+ 			ox = ev.xmotion.x;
+ 			oy = ev.xmotion.y;
+-			/* reposition all windows without a full re-layout */
+ 			arrange(selmon);
+ 			break;
+ 		}
+ 	} while (ev.type != ButtonRelease);
+ 
+ 	XUngrabPointer(dpy, CurrentTime);
+-	/* flush any stale EnterNotify events from the pan */
+ 	while (XCheckMaskEvent(dpy, EnterWindowMask, &ev));
+ }
+ 
+ void
+ view(const Arg *arg)
+ {
++	int oldvx, oldvy, newvx, newvy, oldtag;
++
+ 	if ((arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
+ 		return;
++
++	/* save current tag's viewport before switching */
++	oldtag = seltagidx(selmon);
++	selmon->tagvx[oldtag] = selmon->vx;
++	selmon->tagvy[oldtag] = selmon->vy;
++	oldvx = selmon->vx;
++	oldvy = selmon->vy;
++
+ 	selmon->seltags ^= 1; /* toggle sel tagset */
+ 	if (arg->ui & TAGMASK)
+ 		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+-	/* Suppress XWarpPointer during focus+arrange: windows aren't in their
+-	 * final screen positions yet so any warp would jump to wrong coords. */
++
++	/* restore the new tag's saved viewport */
++	newvx = selmon->tagvx[seltagidx(selmon)];
++	newvy = selmon->tagvy[seltagidx(selmon)];
++	selmon->vx = newvx;
++	selmon->vy = newvy;
++
++	/* lay out new tag's windows at their final positions */
+ 	wmisviewswitching = 1;
+ 	focus(NULL);
+-	arrange(selmon);
++	arrangemon(selmon);
+ 	wmisviewswitching = 0;
+-	/* Now windows are placed — do a single clean warp to the focused window. */
++
++	/* smooth slide from old viewport to new viewport */
++	if (oldvx != newvx || oldvy != newvy)
++		animatepan(selmon, oldvx, oldvy, newvx, newvy);
++
++	/* final arrange to fix stacking, bar, etc. */
++	restack(selmon);
++	showhide(selmon->stack);
+ 	if (mousefollowsfocus && selmon->sel)
+ 		XWarpPointer(dpy, None, selmon->sel->win, 0, 0, 0, 0,
+ 		             WIDTH(selmon->sel) / 2, HEIGHT(selmon->sel) / 2);
